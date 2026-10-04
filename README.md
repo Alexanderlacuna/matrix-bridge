@@ -32,6 +32,7 @@ With matrix-bridge, your coding agent can:
 - **`login-token`** — SSO login (`m.login.token`) for accounts without a password (Google/GitHub OAuth): the bridge creates its own device instead of borrowing a browser session's one. See [docs/e2ee-device-migration.md](docs/e2ee-device-migration.md)
 - **`verify-wait` + automatic emoji verification** — verify the bridge session from Element in one click; the bridge auto-accepts/auto-confirms SAS for its own user only. See [docs/e2ee-session-verification.md](docs/e2ee-session-verification.md)
 - **`restore` / `restore-token`** — key-backup restore and adoption of an existing device, plus helper scripts in [scripts/](scripts/): `sso-login-token.py` (grab an SSO login token), `migrate-bridge.sh` (adopt-a-device migration), `fix-device-id.py` (repair a poisoned device id in the crypto store)
+- **`import-export`** — import an Element "Export E2E room keys" file (`-----BEGIN MEGOLM SESSION DATA-----`) so the bridge can decrypt messages sent *before* it existed. See [docs/e2ee-key-export-import.md](docs/e2ee-key-export-import.md)
 
 ## Install
 
@@ -93,6 +94,9 @@ matrix-bridge restore --recovery-key-file <f> --version <n>
 matrix-bridge verify-wait [--timeout N]
                                      Arm auto-verify (own user only) and sync,
                                      so you can verify this session from Element
+matrix-bridge import-export --file <export.txt> [--passphrase <pw>]
+                                     Import an Element key export (decrypts
+                                     pre-bridge history)
 matrix-bridge send <msg>             Send a message
   --room <id>                        Room ID (overrides default)
   --mention <@user:server>           @mention a user
@@ -258,10 +262,16 @@ Config lives at `~/.matrix-bridge/config.json` (created by `matrix-bridge setup`
 **All messages show as "[encrypted — unable to decrypt]"**
 
 This means the bridge doesn't have the Megolm session keys for those messages. This happens when:
-- You're reading messages sent before the bridge device was created — these can never be decrypted
+- You're reading messages sent before the bridge device was created — these need a key import to decrypt (see below)
 - You need to run `matrix-bridge setup` to create a fresh device with proper key exchange
 
-Messages sent *after* setup will decrypt normally.
+Messages sent *after* setup will decrypt normally. For pre-setup history, export your keys from Element (Settings → Encryption → Export E2E room keys) and run:
+
+```
+matrix-bridge import-export --file element-keys.txt
+```
+
+You'll be prompted for the export passphrase. Messages whose sessions are in the export will decrypt; messages from sessions the exporting device never held remain locked until the sender's device re-shares keys.
 
 **"crypto store doesn't match" error during setup**
 

@@ -222,6 +222,125 @@ impl MatrixBridgeClient {
         Ok(())
     }
 
+    /// Import an Element "Export E2E room keys" file (PEM-armored,
+    /// passphrase-encrypted) into the crypto store. This unlocks messages
+    /// sent before the bridge device existed.
+    pub async fn import_export_file(
+        &self,
+        path: &std::path::Path,
+        passphrase: &str,
+    ) -> Result<()> {
+        use base64::Engine;
+        use ctr::cipher::{KeyIvInit, StreamCipher};
+        use hmac::digest::KeyInit;
+        use hmac::Mac;
+
+        let pem = std::fs::read_to_string(path)?;
+        let b64: String = pem
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with("-----"))
+            .collect();
+        let data = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .map_err(|e| BridgeError::ImportFailed(format!("base64 decode: {e}")))?;
+        if data.len() < 1 + 16 + 16 + 4 + 32 || data[0] != 1 {
+            return Err(BridgeError::ImportFailed(
+                "unsupported export file version".into(),
+            ));
+        }
+        // v1 layout: ver(1) | salt(16) | iv(16) | kdf_iters(4, BE) | ct | hmac(32)
+        let salt = &data[1..17];
+        let iv = &data[17..33];
+        let iterations =
+            u32::from_be_bytes([data[33], data[34], data[35], data[36]]);
+        let (signed, mac) = data.split_at(data.len() - 32);
+        let ciphertext = &signed[37..];
+
+        // PBKDF2-HMAC-SHA512(passphrase, salt, iters, 64B) -> [AES-256 key | HMAC key]
+        let mut key64 = [0u8; 64];
+        pbkdf2::pbkdf2_hmac::<sha2::Sha512>(passphrase.as_bytes(), salt, iterations, &mut key64);
+        let (aes_key, mac_key) = key64.split_at(32);
+
+        // Element HMACs everything except the trailing MAC, using SHA-256
+        let mut hmac = <hmac::Hmac<sha2::Sha256> as hmac::Mac>::new_from_slice(mac_key)
+            .map_err(|e| BridgeError::ImportFailed(format!("hmac init: {e}")))?;
+        hmac.update(signed);
+        let digest = hmac.finalize().into_bytes();
+        if digest.as_slice() != mac {
+            return Err(BridgeError::ImportFailed(
+                "passphrase incorrect (checksum mismatch)".into(),
+            ));
+        }
+
+        // AES-256-CTR, big-endian 128-bit counter (matches Node's aes-256-ctr)
+        let mut cipher = ctr::Ctr128BE::<aes::Aes256>::new_from_slices(aes_key, iv)
+            .map_err(|e| BridgeError::ImportFailed(format!("ctr init: {e}")))?;
+        let mut plaintext = ciphertext.to_vec();
+        cipher.apply_keystream(&mut plaintext);
+
+        let json: serde_json::Value = serde_json::from_slice(&plaintext)
+            .map_err(|e| BridgeError::ImportFailed(format!("decrypted JSON: {e}")))?;
+
+        // Rust-crypto exports a flat JSON array; libolm exports {"rooms": {...}}
+        let mut keys: Vec<matrix_sdk_crypto::olm::ExportedRoomKey> = Vec::new();
+        if let Some(arr) = json.as_array() {
+            for v in arr {
+                keys.push(
+                    serde_json::from_value(v.clone())
+                        .map_err(|e| BridgeError::ImportFailed(format!("session: {e}")))?,
+                );
+            }
+        } else if let Some(rooms) = json.get("rooms").and_then(|r| r.as_object()) {
+            for room_val in rooms.values() {
+                if let Some(sessions) = room_val.get("sessions").and_then(|s| s.as_object()) {
+                    for session_val in sessions.values() {
+                        keys.push(
+                            serde_json::from_value(session_val.clone())
+                                .map_err(|e| BridgeError::ImportFailed(format!("session: {e}")))?,
+                        );
+                    }
+                }
+            }
+        } else {
+            return Err(BridgeError::ImportFailed("unrecognized export JSON".into()));
+        }
+        if keys.is_empty() {
+            return Err(BridgeError::ImportFailed("no sessions in export".into()));
+        }
+        let total = keys.len();
+
+        // Open the bridge's crypto store directly and import. Requires that no
+        // other bridge process is using the store.
+        let creds = Credentials::load(&self.config)?;
+        let store =
+            matrix_sdk_sqlite::SqliteCryptoStore::open(&self.config.store_path, None)
+                .await
+                .map_err(|e| BridgeError::ImportFailed(format!("open store: {e}")))?;
+        let user_id: ruma::OwnedUserId = creds
+            .user_id
+            .parse()
+            .map_err(|e| BridgeError::ImportFailed(format!("user id: {e}")))?;
+        let device_id: ruma::OwnedDeviceId = creds.device_id.into();
+        let machine = matrix_sdk_crypto::OlmMachine::with_store(
+            &user_id,
+            &device_id,
+            store,
+            None,
+        )
+        .await
+        .map_err(|e| BridgeError::ImportFailed(format!("olm machine: {e}")))?;
+        let result = machine
+            .store()
+            .import_exported_room_keys(keys, |imported, _| {
+                info!("imported {imported}/{total}");
+            })
+            .await
+            .map_err(|e| BridgeError::ImportFailed(format!("store import: {e}")))?;
+        println!("Import complete: {result:?}");
+        Ok(())
+    }
+
     /// Restore a previously saved session.
     pub async fn restore(config: &Config) -> Result<Self> {        config.ensure_store_dir()?;
         let creds = Credentials::load(config)?;

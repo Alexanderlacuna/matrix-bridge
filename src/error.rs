@@ -23,6 +23,9 @@ pub enum BridgeError {
     #[error("Send failed: {0}")]
     SendFailed(String),
 
+    #[error("Key import failed: {0}")]
+    ImportFailed(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 

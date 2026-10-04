@@ -1,5 +1,6 @@
 #[cfg(feature = "cli")]
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 #[cfg(feature = "cli")]
 #[derive(Parser)]
@@ -83,6 +84,16 @@ pub enum Commands {
 
     /// List joined rooms
     Rooms,
+
+    /// Import an Element "Export E2E room keys" file (unlocks old messages)
+    ImportExport {
+        /// Path to the export file
+        #[arg(long)]
+        file: PathBuf,
+        /// Passphrase (prompted if omitted and a TTY is available)
+        #[arg(long)]
+        passphrase: Option<String>,
+    },
 
     /// Arm auto-verify and keep syncing, so you can verify the bridge
     /// session from Element (Settings → Sessions → matrix-bridge → Verify).

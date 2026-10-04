@@ -61,6 +61,9 @@ async fn run_command(cli: cli::Cli) -> anyhow::Result<()> {
         } => cmd_send(&message, room, mention, no_mention, cli.json).await?,
         Commands::Read { room, limit } => cmd_read(room, limit, cli.json).await?,
         Commands::Rooms => cmd_rooms(cli.json).await?,
+        Commands::ImportExport { file, passphrase } => {
+            cmd_import_export(file, passphrase).await?
+        }
         Commands::VerifyWait { timeout } => cmd_verify_wait(timeout).await?,
         Commands::SendWait {
             message,
@@ -199,6 +202,21 @@ async fn cmd_restore(recovery_key_file: &str, version: &str) -> anyhow::Result<(
     println!("  Rooms affected:    {}", result.keys.len());
     println!("\nOld messages should now decrypt on the next `matrix-bridge read`.");
 
+    Ok(())
+}
+
+#[cfg(feature = "cli")]
+async fn cmd_import_export(
+    file: std::path::PathBuf,
+    passphrase: Option<String>,
+) -> anyhow::Result<()> {
+    let passphrase = match passphrase {
+        Some(p) => p,
+        None => rpassword::prompt_password("Export passphrase: ")?,
+    };
+    let config = Config::load()?;
+    let client = MatrixBridgeClient::restore(&config).await?;
+    client.import_export_file(&file, &passphrase).await?;
     Ok(())
 }
 
