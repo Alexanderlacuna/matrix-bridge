@@ -27,6 +27,12 @@ With matrix-bridge, your coding agent can:
 - **Cross-platform** — Linux (x86/ARM), macOS (Intel/Apple Silicon). Windows support planned.
 - **TOFU trust** — Trust On First Use device verification, suitable for bot-to-bot communication
 
+### New in this fork
+
+- **`login-token`** — SSO login (`m.login.token`) for accounts without a password (Google/GitHub OAuth): the bridge creates its own device instead of borrowing a browser session's one. See [docs/e2ee-device-migration.md](docs/e2ee-device-migration.md)
+- **`verify-wait` + automatic emoji verification** — verify the bridge session from Element in one click; the bridge auto-accepts/auto-confirms SAS for its own user only. See [docs/e2ee-session-verification.md](docs/e2ee-session-verification.md)
+- **`restore` / `restore-token`** — key-backup restore and adoption of an existing device, plus helper scripts in [scripts/](scripts/): `sso-login-token.py` (grab an SSO login token), `migrate-bridge.sh` (adopt-a-device migration), `fix-device-id.py` (repair a poisoned device id in the crypto store)
+
 ## Install
 
 Currently from source only (GitHub Releases and crates.io coming after broader testing):
@@ -78,6 +84,15 @@ matrix-bridge send-wait "ping" --timeout 30
 
 ```
 matrix-bridge setup                  Interactive login + key setup
+matrix-bridge login-token <token>    Login via SSO login token (no password
+                                     needed — e.g. OAuth-only accounts)
+matrix-bridge restore-token <user> <token> <device>
+                                     Adopt an existing device/session
+matrix-bridge restore --recovery-key-file <f> --version <n>
+                                     Restore E2E keys from server-side backup
+matrix-bridge verify-wait [--timeout N]
+                                     Arm auto-verify (own user only) and sync,
+                                     so you can verify this session from Element
 matrix-bridge send <msg>             Send a message
   --room <id>                        Room ID (overrides default)
   --mention <@user:server>           @mention a user
