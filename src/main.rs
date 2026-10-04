@@ -7,7 +7,7 @@ mod mcp;
 mod trust;
 
 use crate::client::MatrixBridgeClient;
-use crate::config::Config;
+use crate::config::{Config, Credentials};
 use tracing_subscriber::EnvFilter;
 
 #[cfg(feature = "cli")]
@@ -43,6 +43,16 @@ async fn run_command(cli: cli::Cli) -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Setup => cmd_setup().await?,
+        Commands::LoginToken { token } => cmd_login_token(&token).await?,
+        Commands::RestoreToken {
+            user_id,
+            token,
+            device_id,
+        } => cmd_restore_token(&user_id, &token, &device_id).await?,
+        Commands::Restore {
+            recovery_key_file,
+            version,
+        } => cmd_restore(&recovery_key_file, &version).await?,
         Commands::Send {
             message,
             room,
@@ -51,6 +61,7 @@ async fn run_command(cli: cli::Cli) -> anyhow::Result<()> {
         } => cmd_send(&message, room, mention, no_mention, cli.json).await?,
         Commands::Read { room, limit } => cmd_read(room, limit, cli.json).await?,
         Commands::Rooms => cmd_rooms(cli.json).await?,
+        Commands::VerifyWait { timeout } => cmd_verify_wait(timeout).await?,
         Commands::SendWait {
             message,
             room,
@@ -112,6 +123,118 @@ async fn cmd_setup() -> anyhow::Result<()> {
             println!("  {} {}", r.room_id, name);
         }
         println!("\nSet a default room: matrix-bridge config default_room <room_id>");
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "cli")]
+async fn cmd_restore_token(user_id: &str, token: &str, device_id: &str) -> anyhow::Result<()> {
+    if !user_id.starts_with('@') || !user_id.contains(':') {
+        anyhow::bail!("Invalid user ID format. Expected @user:server");
+    }
+
+    let server = user_id.split(':').nth(1).unwrap();
+    let homeserver = format!("https://{}", server);
+
+    let config = Config {
+        homeserver,
+        user_id: user_id.to_string(),
+        device_name: "matrix-bridge".to_string(),
+        store_path: config::default_dir()
+            .join("store")
+            .to_string_lossy()
+            .into_owned(),
+        trust_mode: config::TrustMode::Tofu,
+        default_room: None,
+        default_mention: None,
+        notify_on_mention: None,
+    };
+
+    config.ensure_store_dir()?;
+    config.save()?;
+
+    let creds = Credentials {
+        access_token: token.to_string(),
+        user_id: user_id.to_string(),
+        device_id: device_id.to_string(),
+    };
+    creds.save(&config)?;
+
+    let mut client = MatrixBridgeClient::restore(&config).await?;
+    client.sync_once().await?;
+
+    println!("Session restored from token. Setup complete.");
+    println!("User: {}", config.user_id);
+
+    let rooms = client.get_rooms().await;
+    if !rooms.is_empty() {
+        println!("\nJoined rooms:");
+        for r in &rooms {
+            let name = r.name.as_deref().unwrap_or("(unnamed)");
+            println!("  {} {}", r.room_id, name);
+        }
+        println!("\nSet a default room: matrix-bridge config default_room <room_id>");
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "cli")]
+async fn cmd_restore(recovery_key_file: &str, version: &str) -> anyhow::Result<()> {
+    use matrix_sdk::encryption::RoomKeyImportResult;
+
+    let key = std::fs::read_to_string(recovery_key_file)
+        .map_err(|e| anyhow::anyhow!("cannot read recovery key file: {e}"))?;
+
+    let config = Config::load()?;
+    let mut client = MatrixBridgeClient::restore(&config).await?;
+    client.sync_once().await?;
+
+    let result: RoomKeyImportResult = client.restore_from_backup(key.trim(), version).await?;
+
+    println!("Restore from backup version {version} complete.");
+    println!("  Sessions imported: {}", result.imported_count);
+    println!("  Sessions total:    {}", result.total_count);
+    println!("  Rooms affected:    {}", result.keys.len());
+    println!("\nOld messages should now decrypt on the next `matrix-bridge read`.");
+
+    Ok(())
+}
+
+#[cfg(feature = "cli")]
+async fn cmd_verify_wait(timeout: u64) -> anyhow::Result<()> {
+    let config = Config::load()?;
+    let mut client = MatrixBridgeClient::restore(&config).await?;
+    client.enable_auto_verify().await;
+
+    println!("Auto-verify armed for {timeout}s.");
+    println!("Now in Element: Settings → Security & Privacy → Sessions → matrix-bridge → Verify.");
+    println!("Pick emoji verification — the bridge will accept and confirm automatically.");
+    println!("Waiting...\n");
+
+    client.sync_for(std::time::Duration::from_secs(timeout)).await?;
+
+    println!("Verify-wait finished.");
+    Ok(())
+}
+
+#[cfg(feature = "cli")]
+async fn cmd_login_token(token: &str) -> anyhow::Result<()> {
+    let config = Config::load()?;
+    let mut client = MatrixBridgeClient::login_with_token(&config, token).await?;
+
+    println!("Login successful. Setup complete.");
+    println!("User: {}", config.user_id);
+    println!("Device: {}", client.device_id()?);
+
+    let rooms = client.get_rooms().await;
+    if !rooms.is_empty() {
+        println!("\nJoined rooms:");
+        for r in &rooms {
+            let name = r.name.as_deref().unwrap_or("(unnamed)");
+            println!("  {} {}", r.room_id, name);
+        }
     }
 
     Ok(())

@@ -89,9 +89,141 @@ impl MatrixBridgeClient {
         })
     }
 
-    /// Restore a previously saved session.
-    pub async fn restore(config: &Config) -> Result<Self> {
+    /// Build a client and login with an SSO login token (m.login.token).
+    /// Creates a brand-new device owned solely by the bridge — the clean way
+    /// to set up on OAuth/Google accounts that have no password.
+    pub async fn login_with_token(config: &Config, token: &str) -> Result<Self> {
         config.ensure_store_dir()?;
+
+        let client = Client::builder()
+            .homeserver_url(&config.homeserver)
+            .sqlite_store(&config.store_path, None)
+            .build()
+            .await
+            .map_err(|e| BridgeError::Matrix(e.to_string()))?;
+
+        info!("logging in with SSO token as {}...", config.user_id);
+        let login = client
+            .matrix_auth()
+            .login_token(token)
+            .initial_device_display_name(&config.device_name)
+            .await
+            .map_err(|e| BridgeError::LoginFailed(e.to_string()))?;
+
+        info!("logged in, device_id={}", login.device_id);
+
+        let creds = Credentials {
+            access_token: login.access_token,
+            user_id: login.user_id.to_string(),
+            device_id: login.device_id.to_string(),
+        };
+        creds.save(config)?;
+
+        info!("running initial sync...");
+        client
+            .sync_once(SyncSettings::default())
+            .await
+            .map_err(|e| BridgeError::SyncFailed(e.to_string()))?;
+
+        apply_trust_policy(&client, &config.trust_mode).await;
+
+        Ok(Self {
+            client,
+            config: config.clone(),
+            has_synced: true,
+            sync_task: None,
+        })
+    }
+
+    /// Current device id.
+    pub fn device_id(&self) -> Result<String> {
+        Ok(self
+            .client
+            .device_id()
+            .ok_or(BridgeError::NoSession)?
+            .to_string())
+    }
+
+    /// Register auto-accept handlers for verification requests coming from
+    /// our own user only (self-verification of the bridge session from
+    /// Element). Requests from anyone else are ignored.
+    pub async fn enable_auto_verify(&self) {
+        self.client.add_event_handler(
+            |ev: ruma::events::AnyToDeviceEvent, client: matrix_sdk::Client| async move {
+                let own = client.user_id().map(|u| u.to_owned());
+                match ev {
+                    ruma::events::AnyToDeviceEvent::KeyVerificationRequest(e) => {
+                        if own.as_deref() != Some(&e.sender) {
+                            return;
+                        }
+                        info!("auto-verify: request from {}", e.sender);
+                        if let Some(req) = client
+                            .encryption()
+                            .get_verification_request(&e.sender, &e.content.transaction_id)
+                            .await
+                        {
+                            match req.accept().await {
+                                Ok(()) => info!("auto-verify: request accepted"),
+                                Err(err) => warn!("auto-verify: accept failed: {err}"),
+                            }
+                        }
+                    }
+                    ruma::events::AnyToDeviceEvent::KeyVerificationStart(e) => {
+                        if own.as_deref() != Some(&e.sender) {
+                            return;
+                        }
+                        info!("auto-verify: SAS started");
+                        if let Some(v) = client
+                            .encryption()
+                            .get_verification(&e.sender, e.content.transaction_id.as_str())
+                            .await
+                        {
+                            if let Some(sas) = v.sas() {
+                                let _ = sas.accept().await;
+                            }
+                        }
+                    }
+                    ruma::events::AnyToDeviceEvent::KeyVerificationKey(e) => {
+                        if own.as_deref() != Some(&e.sender) {
+                            return;
+                        }
+                        info!("auto-verify: emoji received, auto-confirming");
+                        if let Some(v) = client
+                            .encryption()
+                            .get_verification(&e.sender, e.content.transaction_id.as_str())
+                            .await
+                        {
+                            if let Some(sas) = v.sas() {
+                                let _ = sas.confirm().await;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            },
+        );
+    }
+
+    /// Keep syncing for the given duration. Needed for verification dances
+    /// (several back-and-forth to-device rounds) which cannot complete in a
+    /// single one-shot sync.
+    pub async fn sync_for(&mut self, duration: std::time::Duration) -> Result<()> {
+        let deadline = std::time::Instant::now() + duration;
+        while std::time::Instant::now() < deadline {
+            if let Err(e) = self
+                .client
+                .sync_once(SyncSettings::default().timeout(std::time::Duration::from_secs(5)))
+                .await
+            {
+                warn!("verify-wait sync error: {e}");
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+        Ok(())
+    }
+
+    /// Restore a previously saved session.
+    pub async fn restore(config: &Config) -> Result<Self> {        config.ensure_store_dir()?;
         let creds = Credentials::load(config)?;
 
         let client = Client::builder()
@@ -309,6 +441,105 @@ impl MatrixBridgeClient {
             });
         }
         rooms
+    }
+
+    /// Restore Megolm room keys from the server-side key backup.
+    ///
+    /// `recovery_key` is the base58 "security key" exported by Element
+    /// (starts with `EsT`). `version` is the backup version from
+    /// `GET /_matrix/client/v3/room_keys/version`.
+    pub async fn restore_from_backup(
+        &self,
+        recovery_key: &str,
+        version: &str,
+    ) -> Result<matrix_sdk::encryption::RoomKeyImportResult> {
+        use matrix_sdk_crypto::{
+            olm::ExportedRoomKey, store::types::BackupDecryptionKey,
+            types::RoomKeyBackupInfo, OlmMachine,
+        };
+        use matrix_sdk_sqlite::SqliteCryptoStore;
+        use ruma::api::client::backup::{
+            get_backup_info::v3::Request as InfoRequest,
+            get_backup_keys::v3::Request as KeysRequest,
+        };
+
+        let decryption_key = BackupDecryptionKey::from_base58(recovery_key)
+            .map_err(|e| BridgeError::Config(format!("invalid recovery key: {e}")))?;
+
+        // Sanity-check that the recovery key matches the backup on the server.
+        let info_resp = self
+            .client
+            .send(InfoRequest::new(version.to_owned()))
+            .await
+            .map_err(|e| BridgeError::Matrix(format!("cannot fetch backup info: {e}")))?;
+        let backup_info: RoomKeyBackupInfo = serde_json::from_str(info_resp.algorithm.json().get())
+            .map_err(|e| BridgeError::Matrix(format!("cannot parse backup info: {e}")))?;
+        if !decryption_key.backup_key_matches(&backup_info) {
+            return Err(BridgeError::Config(
+                "recovery key does not match the server-side backup".to_string(),
+            ).into());
+        }
+        info!(
+            "backup version {} holds {} keys",
+            info_resp.version, info_resp.count
+        );
+
+        // Download all backed-up keys.
+        let keys_resp = self
+            .client
+            .send(KeysRequest::new(version.to_owned()))
+            .await
+            .map_err(|e| BridgeError::Matrix(format!("cannot download backup keys: {e}")))?;
+
+        // Decrypt every session with the recovery key.
+        let mut exported = Vec::new();
+        let mut failed = 0usize;
+        for (room_id, room_backup) in keys_resp.rooms {
+            for (session_id, raw_key_data) in room_backup.sessions {
+                let key_data = match raw_key_data.deserialize() {
+                    Ok(kd) => kd,
+                    Err(_) => {
+                        failed += 1;
+                        continue;
+                    }
+                };
+                match decryption_key.decrypt_session_data(key_data.session_data) {
+                    Ok(backed_up) => exported.push(
+                        ExportedRoomKey::from_backed_up_room_key(room_id.clone(), session_id, backed_up),
+                    ),
+                    Err(_) => failed += 1,
+                }
+            }
+        }
+        if failed > 0 {
+            warn!("{} sessions failed to decrypt from backup", failed);
+        }
+
+        // Import into the crypto store. We open the same SQLite store the
+        // client uses and build an OlmMachine over it, since matrix-sdk 0.14
+        // does not expose the client's machine publicly.
+        let user_id = self
+            .client
+            .user_id()
+            .ok_or_else(|| BridgeError::Matrix("no user id".to_string()))?;
+        let device_id = self
+            .client
+            .device_id()
+            .ok_or_else(|| BridgeError::Matrix("no device id".to_string()))?;
+        let store = SqliteCryptoStore::open(&self.config.store_path, None)
+            .await
+            .map_err(|e| BridgeError::Matrix(format!("cannot open crypto store: {e}")))?;
+        let machine = OlmMachine::with_store(user_id, device_id, store, None)
+            .await
+            .map_err(|e| BridgeError::Matrix(format!("cannot create olm machine: {e}")))?;
+
+        let result = machine
+            .store()
+            .import_room_keys(exported, Some(version), |_, _| {})
+            .await
+            .map_err(|e| BridgeError::Matrix(format!("key import failed: {e}")))?;
+
+        Ok(result)
     }
 
     /// Join a room by ID or alias.

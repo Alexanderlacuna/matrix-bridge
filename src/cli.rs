@@ -19,6 +19,39 @@ pub enum Commands {
     /// Interactive setup: login, create device, save config
     Setup,
 
+    /// Login via an SSO login token (m.login.token) — for OAuth/Google accounts.
+    /// Flow: open <homeserver>/_matrix/client/v3/login/sso/redirect?redirectUrl=http://localhost:8765/callback
+    /// in a browser, authenticate, then copy the `loginToken` from the redirect URL.
+    LoginToken {
+        /// The loginToken from the SSO redirect URL
+        token: String,
+    },
+
+    /// Restore a session from an existing access token.
+    /// Useful for accounts created via OAuth/Google that don't have a password.
+    RestoreToken {
+        /// Matrix user ID (e.g. @user:matrix.org)
+        user_id: String,
+
+        /// Existing access token from Element or another Matrix client
+        token: String,
+
+        /// Existing device ID associated with the token
+        device_id: String,
+    },
+
+    /// Restore Megolm room keys from the server-side key backup
+    /// (requires the recovery key / "security key" from Element)
+    Restore {
+        /// Path to a file containing the base58 recovery key (starts with EsT)
+        #[arg(long)]
+        recovery_key_file: String,
+
+        /// Backup version (see GET /_matrix/client/v3/room_keys/version)
+        #[arg(long, default_value = "7")]
+        version: String,
+    },
+
     /// Send a message to a room
     Send {
         /// Message text
@@ -50,6 +83,15 @@ pub enum Commands {
 
     /// List joined rooms
     Rooms,
+
+    /// Arm auto-verify and keep syncing, so you can verify the bridge
+    /// session from Element (Settings → Sessions → matrix-bridge → Verify).
+    /// The bridge accepts and confirms the emoji comparison automatically.
+    VerifyWait {
+        /// How long to wait for the verification flow (seconds)
+        #[arg(long, default_value = "180")]
+        timeout: u64,
+    },
 
     /// Send a message and wait for a reply
     SendWait {

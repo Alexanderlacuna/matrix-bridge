@@ -31,6 +31,9 @@ matrix-sdk = { version = "=0.14.0", default-features = false, features = [
     "rustls-tls",
     "markdown",
 ] }
+matrix-sdk-crypto = { version = "=0.14.0", default-features = false }
+matrix-sdk-sqlite = { version = "=0.14.0", default-features = false, features = ["crypto-store", "bundled"] }
+ruma = { version = "=0.13.0", default-features = false }
 
 # Async
 tokio = { version = "1", features = ["full"] }
